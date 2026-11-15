@@ -3,10 +3,13 @@
 //! The parent of the CUDA and HIP lines: one page-locked, device-mapped host page holding one
 //! [`CompletionLine`], which a stream stores sequence numbers into behind its work. Each vendor
 //! supplies only its driver table ([`LineDriver`]); the ownership rules live here once:
-//! - a store is accepted only from a stream of the domain (CUDA context, HIP device) the line was
-//!   made in, so `Drop` can wait for it;
-//! - `Drop` frees the page only after that domain settled; if it cannot, the page is leaked,
-//!   never freed under a pending store (CWE-416);
+//! - the line holds its own reference to its domain (the CUDA primary context, or the HIP
+//!   device's primary context) from before the page is allocated until after it is freed, so no
+//!   other owner letting the domain go can free the page under the line (CWE-416; 0.1.0 freed it
+//!   with a context the line did not keep alive);
+//! - a store is accepted only from a stream of that domain, so `Drop` can wait for it;
+//! - `Drop` frees the page only after that domain settled, then releases the domain; if it cannot
+//!   settle, the page and the reference are leaked, never freed under a pending store;
 //! - the host reads the line only through atomics; the device writes only the words named.
 
 #![allow(unsafe_code)]
@@ -73,20 +76,25 @@ impl From<LineError> for crate::Error {
 pub(crate) trait LineDriver {
     /// The vendor's stream handle.
     type Stream: Copy;
-    /// The calling thread's current domain (context or device).
-    fn domain_current(&self) -> Result<u64, LineError>;
-    /// A page-locked, device-mapped host page of `bytes`.
-    fn alloc_host(&self, bytes: usize) -> Result<NonNull<c_void>, LineError>;
+    /// A domain the line holds a reference to (the vendor handles needed to use and release it).
+    type Domain: Copy;
+    /// Take a reference to the domain of the calling thread's current context or device, which
+    /// keeps it alive until [`Self::release`]; [`LineError::NoDomain`] when none is current.
+    fn retain_current(&self) -> Result<Self::Domain, LineError>;
+    /// Drop one reference from [`Self::retain_current`], once.
+    fn release(&self, domain: Self::Domain);
+    /// A page-locked, device-mapped host page of `bytes`, owned by `domain`.
+    fn alloc_host(&self, domain: Self::Domain, bytes: usize) -> Result<NonNull<c_void>, LineError>;
     /// The device address of `host`, a page from [`Self::alloc_host`] not yet freed.
-    fn device_address(&self, host: NonNull<c_void>) -> Result<u64, LineError>;
-    /// Free a page from [`Self::alloc_host`], once.
-    fn free_host(&self, host: NonNull<c_void>);
-    /// The domain `stream` belongs to.
-    fn stream_domain(&self, stream: Self::Stream) -> Result<u64, LineError>;
+    fn device_address(&self, domain: Self::Domain, host: NonNull<c_void>) -> Result<u64, LineError>;
+    /// Free a page from [`Self::alloc_host`], once, while `domain` is still retained.
+    fn free_host(&self, domain: Self::Domain, host: NonNull<c_void>);
+    /// Whether `stream` belongs to `domain`.
+    fn stream_in(&self, stream: Self::Stream, domain: Self::Domain) -> Result<bool, LineError>;
     /// Queue a store of `value` at device address `addr` on `stream`.
     fn write_value(&self, stream: Self::Stream, addr: u64, value: u64) -> Result<(), LineError>;
     /// Wait for every queued work of `domain`; `false` if the driver could not.
-    fn settle(&self, domain: u64) -> bool;
+    fn settle(&self, domain: Self::Domain) -> bool;
 }
 
 /// A device-mapped host line over driver `D`.
@@ -94,35 +102,39 @@ pub(crate) struct Line<D: LineDriver> {
     host: NonNull<CompletionLine>,
     device: u64,
     driver: D,
-    domain: u64,
+    domain: D::Domain,
     queued: Cell<bool>,
 }
 
 // WHY: a line owns a raw mapped page, which withholds the auto `Send`; the executor moves the owner between threads.
-// SAFETY: the page is owned by this value alone and the host touches it only through atomics
-// (which are `Sync`); the driver table is `Send` by the bound. `queued` is a `Cell`, so the value
-// is `Send` but not `Sync`, which is all a line needs.
+// SAFETY: the page and the domain reference are owned by this value alone and the host touches
+// the page only through atomics (which are `Sync`); the driver table is `Send` by the bound, and a
+// domain reference is a plain handle every driver call takes explicitly (no thread-current
+// state). `queued` is a `Cell`, so the value is `Send` but not `Sync`, which is all a line needs.
 // NO SAFE ALTERNATIVE: a raw-pointer owner is never `Send` by derivation, and wrapping the page would add an indirection on every host read.
 unsafe impl<D: LineDriver + Send> Send for Line<D> {}
 
 impl<D: LineDriver> Line<D> {
-    /// A fresh line reading all 0, mapped for the calling thread's current domain.
+    /// A fresh line reading all 0, mapped for (and holding a reference to) the calling thread's
+    /// current domain.
     pub(crate) fn with_driver(driver: D) -> Result<Self, LineError> {
-        let domain = driver.domain_current();
-        let page = driver.alloc_host(PAGE)?;
-        let device = driver.device_address(page);
-        // Built before the checks, so every error below frees the page through `Drop`.
-        let line = Self {
+        let domain = driver.retain_current()?;
+        let page = match driver.alloc_host(domain, PAGE) {
+            Ok(page) => page,
+            Err(e) => {
+                driver.release(domain);
+                return Err(e);
+            }
+        };
+        // Built before the last check, so its error frees the page and releases through `Drop`.
+        let mut line = Self {
             host: page.cast::<CompletionLine>(),
-            device: device.unwrap_or(0),
+            device: 0,
             driver,
-            domain: domain.unwrap_or(0),
+            domain,
             queued: Cell::new(false),
         };
-        device?;
-        if domain? == 0 {
-            return Err(LineError::NoDomain);
-        }
+        line.device = line.driver.device_address(domain, page)?;
         for w in &line.line().words {
             w.store(0, Ordering::Release);
         }
@@ -144,9 +156,9 @@ impl<D: LineDriver> Line<D> {
     pub(crate) fn line(&self) -> &CompletionLine {
         // WHY: reads the owned mapped page as a `CompletionLine` without copying it.
         // SAFETY: `host` is the live, page-aligned (so 64-aligned, as `CompletionLine` needs) page
-        // this value owns until `Drop`; the device writes it only with aligned 8-byte stores to
-        // its words and every host access goes through the atomics, so nothing aliases it
-        // non-atomically.
+        // this value owns until `Drop`, in a domain this value keeps alive until then; the device
+        // writes it only with aligned 8-byte stores to its words and every host access goes
+        // through the atomics, so nothing aliases it non-atomically.
         // NO SAFE ALTERNATIVE: a `NonNull<T>` deref is unsafe; the page must stay in place because the device writes it.
         unsafe { self.host.as_ref() }
     }
@@ -159,7 +171,7 @@ impl<D: LineDriver> Line<D> {
         value: u64,
     ) -> Result<(), LineError> {
         let offset = 8 * u64::try_from(slot.index()).map_err(|_| LineError::Unavailable)?;
-        if self.driver.stream_domain(stream)? != self.domain {
+        if !self.driver.stream_in(stream, self.domain)? {
             return Err(LineError::ForeignStream);
         }
         // Set before the call: a store the driver queued despite a failing status still makes
@@ -177,11 +189,12 @@ impl<D: LineDriver> Line<D> {
 impl<D: LineDriver> Drop for Line<D> {
     fn drop(&mut self) {
         if !self.settled() {
-            // A store may still be pending into the page: leak 4 KiB rather than free memory the
-            // device may yet write.
+            // A store may still be pending into the page: leak 4 KiB (and the domain reference
+            // that keeps the mapping valid) rather than free memory the device may yet write.
             return;
         }
-        self.driver.free_host(self.host.cast::<c_void>());
+        self.driver.free_host(self.domain, self.host.cast::<c_void>());
+        self.driver.release(self.domain);
     }
 }
 

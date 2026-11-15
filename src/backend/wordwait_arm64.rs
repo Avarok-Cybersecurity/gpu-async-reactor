@@ -13,13 +13,26 @@ use crate::core::line::CompletionLine;
 /// `HWCAP2_WFXT` (arm64 `asm/hwcap.h`): FEAT_WFxT, the timed wait-for-event.
 const HWCAP2_WFXT: u64 = 1 << 31;
 
-/// This core's word-wait capabilities, read once.
+/// This core's word-wait capabilities, read once. A value is proof that the core has the
+/// instructions [`WordWait::park`](super::WordWait::park) executes, so the only way to get one is
+/// [`WordWait::probe`](super::WordWait::probe); it cannot be written by hand (in 0.1.0 the fields
+/// were public, and a forged `timed: true` ran `wfet` on a core without FEAT_WFxT: SIGILL).
+///
+/// ```compile_fail,E0451
+/// use gpu_async_reactor::backend::wordwait::WordWait;
+/// let forged = WordWait { timed: true, counter_hz: 24_000_000 };
+/// ```
+///
+/// ```
+/// use gpu_async_reactor::backend::wordwait::WordWait;
+/// let w = WordWait::probe().expect("every aarch64 Linux core has ldxr + wfe");
+/// assert!(w.counter_hz() > 0);
+/// let _: bool = w.timed();
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WordWait {
-    /// FEAT_WFxT present: a park is bounded by its own deadline.
-    pub timed: bool,
-    /// The generic timer's frequency (`cntfrq_el0`), Hz.
-    pub counter_hz: u64,
+    timed: bool,
+    counter_hz: u64,
 }
 
 fn counter() -> u64 {
@@ -36,6 +49,19 @@ fn counter() -> u64 {
 }
 
 impl WordWait {
+    /// FEAT_WFxT present: a park is bounded by its own deadline (else by the kernel's event
+    /// stream).
+    #[must_use]
+    pub fn timed(&self) -> bool {
+        self.timed
+    }
+
+    /// The generic timer's frequency (`cntfrq_el0`), Hz.
+    #[must_use]
+    pub fn counter_hz(&self) -> u64 {
+        self.counter_hz
+    }
+
     /// Read the counter frequency and whether FEAT_WFxT is present (every aarch64 Linux core
     /// has `ldxr` + `wfe`).
     pub(super) fn probe_arch() -> Result<Self, &'static str> {

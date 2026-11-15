@@ -46,8 +46,9 @@ use gpu_async_reactor::host::std_host::StdClock;
 use gpu_async_reactor::{Slot, WaitPlan, run_inline, wait};
 
 let plan = WaitPlan::parse("flag:park_us=100,backstop_us=1000")?;
-let line = MappedLine::new()?;                       // one 64-byte line, device-mapped
-let stream = unsafe { CuStream::from_raw(raw) };     // your live CUstream
+let line = MappedLine::new()?;                       // one 64-byte line, device-mapped, owned by
+                                                     // (and retaining) the device's primary context
+let stream = unsafe { CuStream::from_raw(raw) };     // your live CUstream, on the primary context
 let (clock, mut seq) = (StdClock::new(), 0);
 // ... enqueue work on `stream` ...
 let mut port = CudaPort::new(&line, stream, Slot::new(0).unwrap(), &mut seq, WordWait::probe().ok());
@@ -173,11 +174,31 @@ method, C1-C64) measured them equal within noise in tok/s, CPU and J/token, so `
 - **Handles:** `CuStream::from_raw` and `HipStream::from_raw` are `unsafe fn`: the driver
   dereferences the handle, and a bogus or destroyed one faults inside the driver (CWE-822). Build
   them only from live streams you own.
-- **Use-after-free of the mapped page (CWE-416) is excluded by construction:** a line accepts a
-  store only from a stream of the context (CUDA) or device (HIP) it was made in, and its `Drop`
-  synchronizes that context or device before freeing the page; if that synchronization fails, the
-  4 KiB page is leaked, never freed under a pending store. These rules are tested against a fake
-  driver with no GPU (`backend::mapped` tests).
+- **The mapped page outlives every other owner of its context.** A line belongs to the primary
+  context of the current context's device and holds its own reference to it
+  (`cuDevicePrimaryCtxRetain`; HIP: `hipDevicePrimaryCtxRetain`) from before the page is
+  allocated until after it is freed. Another owner releasing the context, or destroying a
+  non-primary context that was current when the line was made, cannot free the page. A store is
+  accepted only from a stream of that primary context (CUDA) or device (HIP): a stream of a
+  `cuCtxCreate` context, which the line cannot keep alive, is refused with `ForeignStream`. `Drop`
+  synchronizes the context before freeing the page, then releases it; if that synchronization
+  fails, the page and the reference are leaked, never freed under a pending store. The ordering
+  is tested against a fake driver with no GPU (`backend::mapped` tests) and on a GB10
+  (`tests/cuda_line_lifetime.rs`, `#[ignore]`d without a GPU).
+  - **Fixed in 0.1.1 (CWE-416; advisory pending):** 0.1.0 claimed this was excluded by
+    construction, and it was not: the line took no reference to its context, so safe code that
+    dropped its context owner before the line (for example `cudarc`'s `CudaContext`) left the line
+    reading freed memory (SIGSEGV), and a new line could be handed the same page. Upgrade to
+    0.1.1.
+  - **What remains assumed:** nothing resets the device while a line lives
+    (`cuDevicePrimaryCtxReset`, `cudaDeviceReset`, `hipDeviceReset`). A reset frees every
+    allocation of every user in the process regardless of references, so a wrapper that exposes it
+    as safe is unsound on its own. `cuCtxDestroy` on a retained primary context is refused by the
+    driver (measured: status 201, the line stays valid).
+- **A word-wait capability cannot be forged.** `WordWait` has private fields; its only
+  constructor is `WordWait::probe`, which reads the CPU (on x86-64, only CPUID leaves the CPU
+  reports). 0.1.0 had public fields, so safe code could build a `WordWait` claiming an instruction
+  the core lacks, and `park` would execute it (SIGILL, CWE-754).
 - **The device word is never the authority.** A wait returns `Ok` only after the stream's status
   query or blocking wait said done; a lost or late store costs at most one backstop interval.
 - The park reads the line only through atomics and leaves the exclusive monitor armed (a `clrex`
@@ -206,9 +227,9 @@ Rust **1.88** (edition 2024, `let` chains). The MSRV is raised only in a minor r
 
 ## 🚧 Status
 
-`0.1.0`, early release. The core, the CUDA backend and the aarch64 word wait run in production in the
+`0.1.1`, early release. The core, the CUDA backend and the aarch64 word wait run in production in the
 Metrale Engine on GB10; HIP, x86-64 word waits and Metal are compile-checked, awaiting hardware
-runs. Not yet published to crates.io.
+runs.
 
 ## ⚖️ License
 
