@@ -182,10 +182,12 @@ mod tests {
 
     #[test]
     fn a_park_sleeps_until_the_store_instead_of_spinning() {
-        // Each park returns on the store, its 100 us bound or the ~100 us event stream: ~100
-        // calls in 10 ms. A park that spins returns in ~60 ns: ~1e5 calls (the `clrex` bug,
-        // 2026-11-14). Both the timed and the plain arm, back to back (the monitor state of one
-        // park must not wake the next).
+        // Each park returns on the store, its 100 us bound or the kernel's event stream: ~100
+        // calls in 10 ms on GB10 (10 kHz stream), ~450 on a GitHub Neoverse runner (faster
+        // stream). A park that spins returns in ~60 ns: ~1e5 calls (the `clrex` bug,
+        // 2026-11-14, measured 160,636). The bound sits 20x under a spin and >10x over the
+        // fastest event stream seen, so it separates the two on any host. Both the timed and
+        // the plain arm, back to back (the monitor state of one park must not wake the next).
         let probed = WordWait::probe().expect("aarch64 Linux has a word wait");
         let plain = WordWait {
             timed: false,
@@ -193,7 +195,7 @@ mod tests {
         };
         for w in [probed, plain, probed] {
             let parks = parks_until_a_store_in_10_ms(w);
-            assert!(parks <= 400, "{parks} parks in ~10 ms (timed {}): the park spins", w.timed);
+            assert!(parks <= 5_000, "{parks} parks in ~10 ms (timed {}): the park spins", w.timed);
         }
     }
 }

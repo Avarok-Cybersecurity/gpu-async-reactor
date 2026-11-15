@@ -49,9 +49,9 @@ fn main() -> Result<(), gpu_async_reactor::Error> {
     let device = {
         let line = Arc::clone(&line);
         std::thread::spawn(move || {
-            for slot in 0..3usize {
+            for word in line.words.iter().take(3) {
                 std::thread::sleep(Duration::from_millis(2));
-                line.words[slot].store(1, Ordering::Release);
+                word.store(1, Ordering::Release);
             }
         })
     };
