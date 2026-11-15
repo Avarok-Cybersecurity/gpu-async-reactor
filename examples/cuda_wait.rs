@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A real CUDA wait: a 256 MiB `cuMemsetD8Async` on a stream, then [`wait`] with each plan
+//! A real CUDA wait, on the device's primary context (the only context a [`MappedLine`] accepts
+//! streams from): a 256 MiB `cuMemsetD8Async` on a stream, then [`wait`] with each plan
 //! (`block`, `poll`, `flag`, `flag+predict`) over a [`CudaPort`]; prints the wait time and how
 //! each wait ended. Needs an NVIDIA driver and GPU.
 //!
@@ -15,7 +16,8 @@ use libloading::Library;
 
 type Init = unsafe extern "C" fn(u32) -> i32;
 type DeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
-type CtxCreate = unsafe extern "C" fn(*mut u64, u32, i32) -> i32;
+type PrimaryRetain = unsafe extern "C" fn(*mut u64, i32) -> i32;
+type CtxSetCurrent = unsafe extern "C" fn(u64) -> i32;
 type StreamCreate = unsafe extern "C" fn(*mut u64, u32) -> i32;
 type MemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
 type MemsetAsync = unsafe extern "C" fn(u64, u8, usize, u64) -> i32;
@@ -26,10 +28,10 @@ fn check(what: &str, s: i32) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const BYTES: usize = 256 << 20;
-    // WHY: the example creates its own context, stream and buffer through the raw driver API, to show a stream wait without a vendor crate.
+    // WHY: the example retains the device's primary context (the one a line belongs to) and makes its stream and buffer through the raw driver API, to show a stream wait without a vendor crate.
     // SAFETY: the example's own driver setup: each symbol has the cuda.h signature named by its
-    // type, every out-pointer is a live local, and the context, stream and buffer live until the
-    // process exits.
+    // type, every out-pointer is a live local, and the context reference, stream and buffer live
+    // until the process exits.
     // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer.
     let (stream, buf, memset) = unsafe {
         let lib = Library::new("libcuda.so.1")?;
@@ -37,7 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dev = 0;
         check("cuDeviceGet", lib.get::<DeviceGet>(b"cuDeviceGet")?(&raw mut dev, 0));
         let mut ctx = 0u64;
-        check("cuCtxCreate", lib.get::<CtxCreate>(b"cuCtxCreate_v2")?(&raw mut ctx, 0, dev));
+        check("cuDevicePrimaryCtxRetain", lib.get::<PrimaryRetain>(b"cuDevicePrimaryCtxRetain")?(&raw mut ctx, dev));
+        check("cuCtxSetCurrent", lib.get::<CtxSetCurrent>(b"cuCtxSetCurrent")?(ctx));
         let mut s = 0u64;
         check("cuStreamCreate", lib.get::<StreamCreate>(b"cuStreamCreate")?(&raw mut s, 1));
         let mut buf = 0u64;
@@ -47,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (s, buf, memset)
     };
     // WHY: wraps the example's raw stream handle in the typed stream the reactor waits on.
-    // SAFETY: `stream` was just created on the current context and is never destroyed.
+    // SAFETY: `stream` was just created on the retained primary context and is never destroyed.
     // NO SAFE ALTERNATIVE: `CuStream::from_raw` is the crate's only constructor from a handle, and the handle comes from the driver.
     let cu = unsafe { CuStream::from_raw(stream) };
     let line = MappedLine::new()?;

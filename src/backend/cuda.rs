@@ -52,6 +52,9 @@ type AllocHost = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
 type HostDevPtr = unsafe extern "C" fn(*mut u64, *mut c_void, u32) -> i32;
 type FreeHost = unsafe extern "C" fn(*mut c_void) -> i32;
 type CtxGet = unsafe extern "C" fn(*mut u64) -> i32;
+type CtxGetDevice = unsafe extern "C" fn(*mut i32) -> i32;
+type PrimaryRetain = unsafe extern "C" fn(*mut u64, i32) -> i32;
+type PrimaryRelease = unsafe extern "C" fn(i32) -> i32;
 type WriteValue64 = unsafe extern "C" fn(u64, u64, u64, u32) -> i32;
 type CtxPush = unsafe extern "C" fn(u64) -> i32;
 type CtxPop = unsafe extern "C" fn(*mut u64) -> i32;
@@ -69,6 +72,9 @@ pub(crate) struct CudaDriver {
     dev_ptr: HostDevPtr,
     free: FreeHost,
     ctx_get: CtxGet,
+    ctx_device: CtxGetDevice,
+    retain: PrimaryRetain,
+    release: PrimaryRelease,
     write: WriteValue64,
     push: CtxPush,
     pop: CtxPop,
@@ -103,6 +109,9 @@ impl CudaDriver {
             dev_ptr: sym!(lib, HostDevPtr, b"cuMemHostGetDevicePointer_v2"),
             free: sym!(lib, FreeHost, b"cuMemFreeHost"),
             ctx_get: sym!(lib, CtxGet, b"cuCtxGetCurrent"),
+            ctx_device: sym!(lib, CtxGetDevice, b"cuCtxGetDevice"),
+            retain: sym!(lib, PrimaryRetain, b"cuDevicePrimaryCtxRetain"),
+            release: sym!(lib, PrimaryRelease, b"cuDevicePrimaryCtxRelease_v2"),
             write: sym!(lib, WriteValue64, b"cuStreamWriteValue64_v2"),
             push: sym!(lib, CtxPush, b"cuCtxPushCurrent_v2"),
             pop: sym!(lib, CtxPop, b"cuCtxPopCurrent_v2"),
@@ -119,53 +128,108 @@ fn ok(status: i32) -> Result<(), LineError> {
     if status == 0 { Ok(()) } else { Err(LineError::Status(status)) }
 }
 
+/// A retained primary context: the handle and the device whose reference the line holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrimaryCtx {
+    ctx: u64,
+    device: i32,
+}
+
+impl CudaDriver {
+    /// Run `f` with `ctx` pushed current on the calling thread, then restore the thread's stack.
+    fn in_ctx<T>(&self, ctx: u64, f: impl FnOnce() -> T) -> Result<T, LineError> {
+        // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
+        // SAFETY: `ctx` is a primary context the calling line holds a reference to, so it is
+        // live; the push is undone by the pop, which writes only `popped`.
+        // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
+        ok(unsafe { (self.push)(ctx) })?;
+        let r = f();
+        let mut popped = 0u64;
+        // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
+        // SAFETY: pops the context pushed above; `popped` is a live out-pointer.
+        // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
+        ok(unsafe { (self.pop)(&raw mut popped) })?;
+        Ok(r)
+    }
+}
+
 impl LineDriver for CudaDriver {
     type Stream = CuStream;
+    type Domain = PrimaryCtx;
 
-    fn domain_current(&self) -> Result<u64, LineError> {
+    fn retain_current(&self) -> Result<PrimaryCtx, LineError> {
+        let mut current = 0u64;
+        // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
+        // SAFETY: `current` is a live out-pointer, the only memory written.
+        // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
+        ok(unsafe { (self.ctx_get)(&raw mut current) })?;
+        if current == 0 {
+            return Err(LineError::NoDomain);
+        }
+        let mut device = 0i32;
+        // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
+        // SAFETY: a context is current (checked above); `device` is a live out-pointer.
+        // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
+        ok(unsafe { (self.ctx_device)(&raw mut device) })?;
         let mut ctx = 0u64;
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
-        // SAFETY: `ctx` is a live out-pointer, the only memory written.
+        // SAFETY: `device` is the current context's device; `ctx` is a live out-pointer. The
+        // reference taken here is dropped once, by `release` (or leaked with the page).
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
-        ok(unsafe { (self.ctx_get)(&raw mut ctx) })?;
-        Ok(ctx)
+        ok(unsafe { (self.retain)(&raw mut ctx, device) })?;
+        let primary = PrimaryCtx { ctx, device };
+        if ctx == 0 {
+            self.release(primary);
+            return Err(LineError::NoDomain);
+        }
+        Ok(primary)
     }
 
-    fn alloc_host(&self, bytes: usize) -> Result<NonNull<c_void>, LineError> {
+    fn release(&self, primary: PrimaryCtx) {
+        // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
+        // SAFETY: drops the one reference `retain_current` took on this device's primary context.
+        // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
+        let _ = unsafe { (self.release)(primary.device) };
+    }
+
+    fn alloc_host(&self, primary: PrimaryCtx, bytes: usize) -> Result<NonNull<c_void>, LineError> {
         let mut page: *mut c_void = core::ptr::null_mut();
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
-        // SAFETY: `page` is a live out-pointer, the only memory the driver writes; without a
-        // current context the driver returns a status instead.
+        // SAFETY: `page` is a live out-pointer, the only memory the driver writes; the retained
+        // primary context is current for the call, so it owns the page.
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
-        ok(unsafe { (self.alloc)(&raw mut page, bytes) })?;
+        ok(self.in_ctx(primary.ctx, || unsafe { (self.alloc)(&raw mut page, bytes) })?)?;
         NonNull::new(page).ok_or(LineError::Unavailable)
     }
 
-    fn device_address(&self, host: NonNull<c_void>) -> Result<u64, LineError> {
+    fn device_address(&self, primary: PrimaryCtx, host: NonNull<c_void>) -> Result<u64, LineError> {
         let mut device = 0u64;
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
-        // SAFETY: `host` is a live page from `alloc_host`; `device` is a live out-pointer.
+        // SAFETY: `host` is a live page from `alloc_host` in this context; `device` is a live
+        // out-pointer.
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
-        ok(unsafe { (self.dev_ptr)(&raw mut device, host.as_ptr(), 0) })?;
+        ok(self.in_ctx(primary.ctx, || unsafe {
+            (self.dev_ptr)(&raw mut device, host.as_ptr(), 0)
+        })?)?;
         Ok(device)
     }
 
-    fn free_host(&self, host: NonNull<c_void>) {
+    fn free_host(&self, primary: PrimaryCtx, host: NonNull<c_void>) {
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
-        // SAFETY: `host` came from `alloc_host`, is freed once (the line's `Drop`), and every
-        // store queued into it has landed.
+        // SAFETY: `host` came from `alloc_host`, is freed once (the line's `Drop`) in its own
+        // context, which the line still retains, and every store queued into it has landed.
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
-        let _ = unsafe { (self.free)(host.as_ptr()) };
+        let _ = self.in_ctx(primary.ctx, || unsafe { (self.free)(host.as_ptr()) });
     }
 
-    fn stream_domain(&self, stream: CuStream) -> Result<u64, LineError> {
+    fn stream_in(&self, stream: CuStream, primary: PrimaryCtx) -> Result<bool, LineError> {
         let mut owner = 0u64;
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
         // SAFETY: `stream` is live by `CuStream::from_raw`'s contract; `owner` is a live
         // out-pointer, the only memory written.
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
         ok(unsafe { (self.stream_ctx)(stream.0, &raw mut owner) })?;
-        Ok(owner)
+        Ok(owner == primary.ctx)
     }
 
     fn write_value(&self, stream: CuStream, addr: u64, value: u64) -> Result<(), LineError> {
@@ -177,21 +241,11 @@ impl LineDriver for CudaDriver {
         ok(unsafe { (self.write)(stream.0, addr, value, 0) })
     }
 
-    fn settle(&self, ctx: u64) -> bool {
+    fn settle(&self, primary: PrimaryCtx) -> bool {
         // WHY: calls a CUDA driver entry point resolved at run time (the line, stream or context operation).
-        // SAFETY: `ctx` is the context the line was made in; a destroyed one is refused with a
-        // status. Sync waits on the pushed context; pop restores the thread's stack and writes
-        // only `popped`.
+        // SAFETY: waits on the line's retained (so live) primary context, pushed for the call.
         // NO SAFE ALTERNATIVE: the driver API is C: every entry point is an unsafe fn pointer, and the vendor crates' wrappers are unsafe too.
-        unsafe {
-            if (self.push)(ctx) != 0 {
-                return false;
-            }
-            let synced = (self.sync)() == 0;
-            let mut popped = 0u64;
-            let popped_ok = (self.pop)(&raw mut popped) == 0;
-            synced && popped_ok
-        }
+        matches!(self.in_ctx(primary.ctx, || unsafe { (self.sync)() }), Ok(0))
     }
 }
 
@@ -199,7 +253,12 @@ impl LineDriver for CudaDriver {
 pub struct MappedLine(Line<CudaDriver>);
 
 impl MappedLine {
-    /// A fresh line reading all 0, mapped for the calling thread's current context.
+    /// A fresh line reading all 0, owned by the primary context of the device of the calling
+    /// thread's current context. The line holds its own reference to that primary context
+    /// (`cuDevicePrimaryCtxRetain`) until after its page is freed, so it stays valid whoever else
+    /// lets the context go. Only streams of that primary context may store into it; a stream of a
+    /// non-primary context (`cuCtxCreate`), which the line cannot keep alive, is refused with
+    /// [`LineError::ForeignStream`].
     ///
     /// # Errors
     /// The driver's status, [`LineError::Unavailable`] when the driver or an entry point is
@@ -223,7 +282,8 @@ impl MappedLine {
     /// Queue a store of `value` into word `slot` on `stream`, behind the work queued there.
     ///
     /// # Errors
-    /// The driver's status, or [`LineError::ForeignStream`] for a stream of another context.
+    /// The driver's status, or [`LineError::ForeignStream`] for a stream of any context other
+    /// than the line's primary context.
     pub fn enqueue_store(&self, stream: CuStream, slot: Slot, value: u64) -> Result<(), LineError> {
         self.0.enqueue_store(stream, slot, value)
     }

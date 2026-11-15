@@ -6,7 +6,9 @@
 //! - [`StdIdle`]: the executor's idle: `thread::sleep` to a deadline; a park on a line through
 //!   the `wordwait` backend when one was probed, else a yield loop to the bound.
 //! - [`Watcher`]: a background thread that waits on completion lines and wakes the [`Waker`]s
-//!   of futures awaiting them, for consumers on any runtime that are not latency-critical.
+//!   of futures awaiting them, for consumers on any runtime that are not latency-critical. Each
+//!   [`Watch`] owns one registration, removed when it resolves or is dropped; wakers run with no
+//!   lock held.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
@@ -147,16 +149,30 @@ fn line_of<L: AsRef<CompletionLine>>(l: &Arc<L>) -> &CompletionLine {
     (**l).as_ref()
 }
 
+/// One [`Watch`]'s registration.
 struct Entry<L> {
+    id: u64,
     line: Arc<L>,
     slot: Slot,
     target: u64,
     waker: Waker,
 }
 
+/// The registrations, and the id the next one gets.
+struct Table<L> {
+    next: u64,
+    entries: Vec<Entry<L>>,
+}
+
 struct Shared<L> {
-    entries: Mutex<Vec<Entry<L>>>,
+    table: Mutex<Table<L>>,
     stop: std::sync::atomic::AtomicBool,
+}
+
+impl<L> Shared<L> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Table<L>> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A thread that watches completion lines and wakes the futures awaiting them. `L` is anything
@@ -172,24 +188,30 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Watcher<L> {
     #[must_use]
     pub fn spawn(mut idle: StdIdle, park_bound: Duration) -> Self {
         let shared = Arc::new(Shared {
-            entries: Mutex::new(Vec::new()),
+            table: Mutex::new(Table {
+                next: 0,
+                entries: Vec::new(),
+            }),
             stop: std::sync::atomic::AtomicBool::new(false),
         });
         let s = Arc::clone(&shared);
         let bound = DurNs(u64::try_from(park_bound.as_nanos()).unwrap_or(u64::MAX));
         let thread = thread::spawn(move || {
             while !s.stop.load(std::sync::atomic::Ordering::Acquire) {
-                let first = {
-                    let mut e = s.entries.lock().unwrap_or_else(PoisonError::into_inner);
-                    e.retain(|x| {
-                        let done = reached(line_of(&x.line), x.slot, x.target);
-                        if done {
-                            x.waker.wake_by_ref();
-                        }
-                        !done
-                    });
-                    e.first().map(|x| (Arc::clone(&x.line), x.slot, x.target))
+                let (done, first) = {
+                    let mut t = s.lock();
+                    let done: Vec<Entry<L>> = t
+                        .entries
+                        .extract_if(.., |x| reached(line_of(&x.line), x.slot, x.target))
+                        .collect();
+                    let first = t.entries.first().map(|x| (Arc::clone(&x.line), x.slot, x.target));
+                    (done, first)
                 };
+                // Woken with the lock released: a waker may poll or drop a `Watch` of this
+                // watcher (an inline executor does), which takes the lock.
+                for e in done {
+                    e.waker.wake();
+                }
                 match first {
                     None => thread::park(),
                     Some((line, slot, target)) => {
@@ -217,6 +239,7 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Watcher<L> {
             line,
             slot,
             target,
+            id: None,
         }
     }
 }
@@ -233,49 +256,82 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Drop for Watcher<L> {
     }
 }
 
-/// The future of [`Watcher::wait`]: `Send`, usable on any runtime.
+/// The future of [`Watcher::wait`]: `Send`, usable on any runtime. Dropping it before it
+/// resolves (a cancelled await) removes its registration.
 pub struct Watch<L: AsRef<CompletionLine> + Send + Sync + 'static> {
     shared: Arc<Shared<L>>,
     thread: Option<thread::Thread>,
     line: Arc<L>,
     slot: Slot,
     target: u64,
+    /// This future's registration in the watcher, once polled pending.
+    id: Option<u64>,
+}
+
+impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Watch<L> {
+    fn reached(&self) -> bool {
+        reached(line_of(&self.line), self.slot, self.target)
+    }
+
+    /// Remove this future's registration, if it still has one. The entry (its waker and line) is
+    /// dropped after the lock is released.
+    fn deregister(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let removed = {
+            let mut t = self.shared.lock();
+            t.entries
+                .iter()
+                .position(|x| x.id == id)
+                .map(|i| t.entries.swap_remove(i))
+        };
+        drop(removed);
+    }
 }
 
 impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Future for Watch<L> {
     type Output = ();
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if reached(line_of(&self.line), self.slot, self.target) {
+        let this = self.get_mut();
+        if this.reached() {
+            this.deregister();
             return Poll::Ready(());
         }
         {
-            let mut e = self
-                .shared
-                .entries
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match e
-                .iter_mut()
-                .find(|x| Arc::ptr_eq(&x.line, &self.line) && x.slot == self.slot && x.target == self.target)
-            {
+            let mut t = this.shared.lock();
+            let mine = this.id.and_then(|id| t.entries.iter_mut().find(|x| x.id == id));
+            match mine {
                 Some(x) => x.waker.clone_from(cx.waker()),
-                None => e.push(Entry {
-                    line: Arc::clone(&self.line),
-                    slot: self.slot,
-                    target: self.target,
-                    waker: cx.waker().clone(),
-                }),
+                // Not registered yet, or the watcher took the entry out to wake it.
+                None => {
+                    let id = t.next;
+                    t.next = t.next.wrapping_add(1);
+                    t.entries.push(Entry {
+                        id,
+                        line: Arc::clone(&this.line),
+                        slot: this.slot,
+                        target: this.target,
+                        waker: cx.waker().clone(),
+                    });
+                    this.id = Some(id);
+                }
             }
         }
-        if let Some(t) = &self.thread {
+        if let Some(t) = &this.thread {
             t.unpark();
         }
         // A store between the first check and the registration is seen by the watcher's next
         // pass; checking again here makes it immediate.
-        if reached(line_of(&self.line), self.slot, self.target) {
+        if this.reached() {
+            this.deregister();
             return Poll::Ready(());
         }
         Poll::Pending
+    }
+}
+
+impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Drop for Watch<L> {
+    fn drop(&mut self) {
+        self.deregister();
     }
 }

@@ -19,13 +19,27 @@ pub enum Flavor {
     Mwaitx,
 }
 
-/// The CPU's user-mode monitor/wait and its TSC rate.
+/// The CPU's user-mode monitor/wait and its TSC rate. A value is proof that the CPU has the
+/// instruction pair [`WordWait::park`](super::WordWait::park) executes, so the only way to get one
+/// is [`WordWait::probe`](super::WordWait::probe); it cannot be written by hand (in 0.1.0 the
+/// fields were public, and a forged flavor ran `umwait`/`mwaitx` on a CPU without it: SIGILL).
+///
+/// ```compile_fail,E0451
+/// use gpu_async_reactor::backend::wordwait::{Flavor, WordWait};
+/// let forged = WordWait { flavor: Flavor::Umwait, tsc_hz: 1_000_000_000 };
+/// ```
+///
+/// ```
+/// use gpu_async_reactor::backend::wordwait::WordWait;
+/// if let Ok(w) = WordWait::probe() {
+///     assert!(w.tsc_hz() > 0);
+///     let _ = w.flavor();
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WordWait {
-    /// The instruction pair.
-    pub flavor: Flavor,
-    /// TSC ticks per second (CPUID leaf 0x15 when present, else measured at probe).
-    pub tsc_hz: u64,
+    flavor: Flavor,
+    tsc_hz: u64,
 }
 
 /// CPUID.(EAX=7,ECX=0):ECX[5], WAITPKG.
@@ -76,13 +90,29 @@ fn tsc_hz() -> u64 {
 }
 
 impl WordWait {
+    /// The instruction pair.
+    #[must_use]
+    pub fn flavor(&self) -> Flavor {
+        self.flavor
+    }
+
+    /// TSC ticks per second (CPUID leaf 0x15 when present, else measured at probe).
+    #[must_use]
+    pub fn tsc_hz(&self) -> u64 {
+        self.tsc_hz
+    }
+
     pub(super) fn probe_arch() -> Result<Self, &'static str> {
-        let (_, _, ecx7, _) = cpuid(7, 0);
-        let flavor = if ecx7 & WAITPKG != 0 {
+        // A leaf above the CPU's maximum returns another leaf's data, so each is read only when
+        // the CPU reports it.
+        let (max, _, _, _) = cpuid(0, 0);
+        let (max_ext, _, _, _) = cpuid(0x8000_0000, 0);
+        let waitpkg = max >= 7 && cpuid(7, 0).2 & WAITPKG != 0;
+        let flavor = if waitpkg {
             Flavor::Umwait
         } else {
-            let (_, _, ecx, _) = cpuid(0x8000_0001, 0);
-            if ecx & MONITORX == 0 {
+            let monitorx = max_ext >= 0x8000_0001 && cpuid(0x8000_0001, 0).2 & MONITORX != 0;
+            if !monitorx {
                 return Err("no user-mode monitor/wait: the CPU has neither WAITPKG nor MONITORX");
             }
             Flavor::Mwaitx
