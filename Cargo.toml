@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "gpu-async-reactor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+authors = ["Metrale Engine contributors"]
+repository = "https://github.com/Avarok-Cybersecurity/gpu-async-reactor"
+documentation = "https://docs.rs/gpu-async-reactor"
+readme = "README.md"
+description = "Await GPU work as a memory descriptor: a no_std completion port, deadline estimator, typed wait plans and a small FILL executor, with CUDA, HIP and Metal backends and std, tokio and io_uring hosts."
+keywords = ["gpu", "cuda", "async", "reactor", "hip"]
+categories = ["asynchronous", "no-std", "hardware-support", "concurrency"]
+include = ["src/**/*.rs", "examples/**/*.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[features]
+default = []
+## std hosts: `StdClock`, `StdIdle` (thread sleep) and the `Watcher` thread that wakes `Waker`s.
+std = []
+## User-mode word waits: aarch64 `ldxr`+`wfe`/`wfet`, x86-64 `monitorx`/`mwaitx` (AMD) or
+## `umonitor`/`umwait` (Intel). Linux only.
+wordwait = ["std", "dep:libc"]
+## CUDA backend: a device-mapped completion line stored into by `cuStreamWriteValue64`.
+cuda = ["wordwait", "dep:libloading"]
+## HIP backend: the same line stored into by `hipStreamWriteValue64` (compile-checked).
+hip = ["wordwait", "dep:libloading"]
+## Metal backend: an `MTLSharedEvent` as the completion source (Apple targets).
+metal = ["std", "dep:objc2", "dep:objc2-metal"]
+## tokio host: a `Timer` over `tokio::time`.
+tokio = ["std", "dep:tokio"]
+## io_uring host: `IORING_OP_TIMEOUT` (ns) as the executor's deadline sleep (Linux).
+io-uring = ["std", "dep:io-uring", "dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", default-features = false, optional = true }
+libloading = { version = "0.9", default-features = false, features = ["std"], optional = true }
+tokio = { version = "1", default-features = false, features = ["time"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", default-features = false, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLEvent"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["time", "rt", "macros"] }
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+
+[[example]]
+name = "fill_executor"
+required-features = ["std"]
+
+[[example]]
+name = "cuda_wait"
+required-features = ["cuda"]
