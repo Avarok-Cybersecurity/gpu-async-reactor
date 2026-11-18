@@ -53,4 +53,4 @@ pub use crate::core::plan::{
 };
 pub use crate::core::reactor::{Alarmed, Idle, Reactor, Ready, Turn};
 pub use crate::core::time::{Clock, DurNs, MonoNs, Timer};
-pub use crate::core::wait::{CompletionPort, WaitKind, WaitReport, wait};
+pub use crate::core::wait::{CompletionPort, Pace, WaitKind, WaitReport, wait};

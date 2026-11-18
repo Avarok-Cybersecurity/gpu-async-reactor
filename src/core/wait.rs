@@ -43,7 +43,9 @@ pub trait CompletionPort {
     /// The device reports a failure.
     async fn block(&mut self) -> Result<(), Self::Error>;
 
-    /// [`Park::QueryPoll`] and the tail of [`Park::FlagWait`]: query until done.
+    /// [`Park::QueryPoll`] and the tail of [`Park::FlagWait`]: query until done, pacing between
+    /// two queries as the host declared ([`Pace`]): a port run under an executor must pend
+    /// between them, never spin in place.
     ///
     /// # Errors
     /// The device reports a failure.
@@ -61,6 +63,30 @@ pub trait CompletionPort {
     /// # Errors
     /// The park itself fails (never the device status: that is `query`'s).
     async fn park(&mut self, bound: DurNs) -> Result<bool, Self::Error>;
+}
+
+/// What a port does between two status queries of [`CompletionPort::poll`], and in a park that
+/// has no hardware wait to sleep in: the host's declared choice, given when the port is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    /// Spin on the calling thread. Only for an inline host (one wait per thread, the future run
+    /// to completion on its first poll): its thread has nothing else to run.
+    Spin,
+    /// Pend once to the executor between two queries, so every other ready task runs before the
+    /// next one (FILL). Under [`Executor`](crate::Executor) a poll never starves ready work.
+    Yield,
+}
+
+impl Pace {
+    /// One step between two status queries: [`Pace::Spin`] is ready on its first poll,
+    /// [`Pace::Yield`] pends exactly once (waking itself) so the executor runs every other ready
+    /// task first. For ports outside this crate as much as for its own backends.
+    pub async fn step(self) {
+        match self {
+            Self::Spin => core::hint::spin_loop(),
+            Self::Yield => crate::core::executor::yield_now().await,
+        }
+    }
 }
 
 /// How one wait ended.

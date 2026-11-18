@@ -43,7 +43,7 @@ query the stream every millisecond as the error authority):
 use gpu_async_reactor::backend::cuda::{CuStream, CudaPort, MappedLine};
 use gpu_async_reactor::backend::wordwait::WordWait;
 use gpu_async_reactor::host::std_host::StdClock;
-use gpu_async_reactor::{Slot, WaitPlan, run_inline, wait};
+use gpu_async_reactor::{Pace, Slot, WaitPlan, run_inline, wait};
 
 let plan = WaitPlan::parse("flag:park_us=100,backstop_us=1000")?;
 let line = MappedLine::new()?;                       // one 64-byte line, device-mapped, owned by
@@ -51,7 +51,10 @@ let line = MappedLine::new()?;                       // one 64-byte line, device
 let stream = unsafe { CuStream::from_raw(raw) };     // your live CUstream, on the primary context
 let (clock, mut seq) = (StdClock::new(), 0);
 // ... enqueue work on `stream` ...
-let mut port = CudaPort::new(&line, stream, Slot::new(0).unwrap(), &mut seq, WordWait::probe().ok());
+// Pace::Spin: this thread runs one wait inline; under the crate's Executor use Pace::Yield,
+// so a poll pends between queries and every other ready task runs.
+let slot = Slot::new(0).unwrap();
+let mut port = CudaPort::paced(&line, stream, slot, &mut seq, WordWait::probe().ok(), Pace::Spin);
 let report = run_inline(wait(&plan, None, &mut port, &clock, &clock), "my wait")??;
 println!("{:?} after {} ns, {} parks", report.kind, report.wait_ns, report.parks);
 ```
@@ -106,7 +109,7 @@ park: flag ── park(park_us) until the word reaches seq, query() every backst
 
 | feature | host | provides |
 |---|---|---|
-| `std` | `host::std_host` | `StdClock`, `StdIdle` (thread sleep, then the word-wait park or a yield loop), `Watcher` (a thread that wakes `Waker`s; usable from any runtime) |
+| `std` | `host::std_host` | `StdClock`, `StdIdle` (thread sleep, then the word-wait park or a yield loop), `Watcher` (a thread that wakes `Waker`s; usable from any runtime; a `Watch` that outlives it is still served) |
 | `tokio` | `host::tokio` | `TokioClock`: `Clock` + `Timer` over `tokio::time` (1 ms timer wheel: for consumers that are not latency-critical) |
 | `io-uring` | `host::uring` | `UringIdle`: the executor's deadline sleep is one `IORING_OP_TIMEOUT` with a nanosecond timespec (no timer-slack rounding; the same ring can carry network I/O) |
 
@@ -227,7 +230,7 @@ Rust **1.88** (edition 2024, `let` chains). The MSRV is raised only in a minor r
 
 ## 🚧 Status
 
-`0.1.1`, early release. The core, the CUDA backend and the aarch64 word wait run in production in the
+`0.1.2`, early release. The core, the CUDA backend and the aarch64 word wait run in production in the
 Metrale Engine on GB10; HIP, x86-64 word waits and Metal are compile-checked, awaiting hardware
 runs.
 

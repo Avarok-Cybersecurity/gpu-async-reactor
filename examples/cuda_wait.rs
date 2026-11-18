@@ -11,7 +11,7 @@
 use gpu_async_reactor::backend::cuda::{CuStream, CudaPort, MappedLine};
 use gpu_async_reactor::backend::wordwait::WordWait;
 use gpu_async_reactor::host::std_host::StdClock;
-use gpu_async_reactor::{PointTable, Slot, WaitPlan, run_inline, wait};
+use gpu_async_reactor::{Pace, PointTable, Slot, WaitPlan, run_inline, wait};
 use libloading::Library;
 
 type Init = unsafe extern "C" fn(u32) -> i32;
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // NO SAFE ALTERNATIVE: the driver call is an unsafe fn pointer.
             check("cuMemsetD8Async", unsafe { memset(buf, rep, BYTES, stream) });
             let sleep = plan.predict.and_then(|d| points.sleep_ns(&(), &d));
-            let mut port = CudaPort::new(&line, cu, slot, &mut seq, word);
+            let mut port = CudaPort::paced(&line, cu, slot, &mut seq, word, Pace::Spin);
             let r = run_inline(wait(&plan, sleep, &mut port, &clock, &clock), "cuda_wait")??;
             if let (Some(d), Some(o)) = (plan.predict, r.outcome) {
                 points.observe((), &d, o);

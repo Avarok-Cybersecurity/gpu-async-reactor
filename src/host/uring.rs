@@ -20,6 +20,9 @@ pub struct UringIdle {
     clock: StdClock,
     park: StdIdle,
     failed_timeouts: u64,
+    /// The `user_data` of the last timeout submitted: a sleep returns only on its own completion,
+    /// and a completion of an earlier one (left in flight by a failed wait) is discarded.
+    token: u64,
 }
 
 impl UringIdle {
@@ -34,6 +37,7 @@ impl UringIdle {
             clock,
             park,
             failed_timeouts: 0,
+            token: 0,
         })
     }
 
@@ -53,22 +57,38 @@ impl UringIdle {
     }
 
     fn timeout(&mut self, ns: u64) -> std::io::Result<()> {
+        self.token = self.token.wrapping_add(1);
+        let token = self.token;
         let ts = types::Timespec::new()
             .sec(ns / 1_000_000_000)
             .nsec(u32::try_from(ns % 1_000_000_000).unwrap_or(0));
-        let sqe = opcode::Timeout::new(&raw const ts).build();
+        let sqe = opcode::Timeout::new(&raw const ts).build().user_data(token);
         // WHY: submits the timeout entry that bounds the idle on the io_uring.
-        // SAFETY: the entry points at `ts`, which lives until `submit_and_wait` below returns with
-        // the entry's completion; the ring is ours alone and was just drained.
+        // SAFETY: the entry points at `ts`, which lives until the loop below has seen this entry's
+        // own completion (or `submit_and_wait` failed with the entry still unsubmitted or already
+        // prepared: the ring has no SQPOLL thread, so the kernel copies the timespec while
+        // `io_uring_enter` submits it). The ring is ours alone.
         // NO SAFE ALTERNATIVE: `SubmissionQueue::push` is unsafe because the kernel reads the entry's pointers after it returns.
         unsafe { self.ring.submission().push(&sqe) }
             .map_err(|_| std::io::Error::other("submission queue full"))?;
-        self.ring.submit_and_wait(1)?;
-        let cqe = self.ring.completion().next();
-        match cqe.map(|c| c.result()) {
-            Some(r) if r == -ETIME || r >= 0 => Ok(()),
-            Some(r) => Err(std::io::Error::from_raw_os_error(-r)),
-            None => Ok(()),
+        loop {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => {}
+                // A signal ended the wait, not the timeout: wait again for this entry.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+            // Completions of earlier timeouts are stale: their sleeps already returned.
+            let own = self
+                .ring
+                .completion()
+                .find(|c| c.user_data() == token)
+                .map(|c| c.result());
+            match own {
+                Some(r) if r == -ETIME || r >= 0 => return Ok(()),
+                Some(r) => return Err(std::io::Error::from_raw_os_error(-r)),
+                None => {}
+            }
         }
     }
 }
