@@ -167,6 +167,8 @@ struct Table<L> {
 struct Shared<L> {
     table: Mutex<Table<L>>,
     stop: std::sync::atomic::AtomicBool,
+    /// [`Watch`]es handed out and not yet dropped: the thread serves them after `stop`.
+    watches: std::sync::atomic::AtomicUsize,
 }
 
 impl<L> Shared<L> {
@@ -177,6 +179,10 @@ impl<L> Shared<L> {
 
 /// A thread that watches completion lines and wakes the futures awaiting them. `L` is anything
 /// that holds a line (a backend's mapped line, an `Arc`'d plain line).
+///
+/// Dropping the watcher stops its thread once every [`Watch`] it handed out has resolved or been
+/// dropped: a `Watch` that outlives its watcher is still woken. With no `Watch` alive the drop
+/// joins the thread; otherwise the thread exits on its own when the last one goes.
 pub struct Watcher<L: AsRef<CompletionLine> + Send + Sync + 'static> {
     shared: Arc<Shared<L>>,
     thread: Option<JoinHandle<()>>,
@@ -193,11 +199,14 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Watcher<L> {
                 entries: Vec::new(),
             }),
             stop: std::sync::atomic::AtomicBool::new(false),
+            watches: std::sync::atomic::AtomicUsize::new(0),
         });
         let s = Arc::clone(&shared);
         let bound = DurNs(u64::try_from(park_bound.as_nanos()).unwrap_or(u64::MAX));
         let thread = thread::spawn(move || {
-            while !s.stop.load(std::sync::atomic::Ordering::Acquire) {
+            while !(s.stop.load(std::sync::atomic::Ordering::Acquire)
+                && s.watches.load(std::sync::atomic::Ordering::Acquire) == 0)
+            {
                 let (done, first) = {
                     let mut t = s.lock();
                     let done: Vec<Entry<L>> = t
@@ -233,6 +242,9 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Watcher<L> {
     /// A future that resolves once word `slot` of `line` reaches `target`.
     #[must_use]
     pub fn wait(&self, line: Arc<L>, slot: Slot, target: u64) -> Watch<L> {
+        self.shared
+            .watches
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Watch {
             shared: Arc::clone(&self.shared),
             thread: self.thread.as_ref().map(|t| t.thread().clone()),
@@ -248,10 +260,14 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Drop for Watcher<L> {
     fn drop(&mut self) {
         self.shared
             .stop
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
             t.thread().unpark();
-            let _ = t.join();
+            // No `Watch` is alive and none can be made (that takes `&self`): the thread is
+            // leaving. Otherwise it is detached and exits after the last `Watch` drops.
+            if self.shared.watches.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -333,5 +349,16 @@ impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Future for Watch<L> {
 impl<L: AsRef<CompletionLine> + Send + Sync + 'static> Drop for Watch<L> {
     fn drop(&mut self) {
         self.deregister();
+        self.shared
+            .watches
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // A stopped watcher's thread exits once this was the last watch; it may be parked.
+        // SeqCst pairs with the watcher's drop (store `stop`, then load `watches`): either this
+        // sees `stop`, or that drop sees this decrement and joins the thread itself.
+        if self.shared.stop.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(t) = &self.thread
+        {
+            t.unpark();
+        }
     }
 }

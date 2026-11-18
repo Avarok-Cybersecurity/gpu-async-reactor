@@ -238,3 +238,25 @@ fn no_plan_returns_before_the_work_is_done() {
         }
     }
 }
+
+#[test]
+fn a_spin_step_is_ready_at_once_and_a_yield_step_pends_exactly_once_waking_itself() {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    struct Count(AtomicU32);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let woke = Arc::new(Count(AtomicU32::new(0)));
+    let waker = Waker::from(Arc::clone(&woke));
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(pin!(Pace::Spin.step()).poll(&mut cx), Poll::Ready(()));
+    assert_eq!(woke.0.load(Ordering::SeqCst), 0);
+    let mut y = pin!(Pace::Yield.step());
+    assert_eq!(y.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(woke.0.load(Ordering::SeqCst), 1, "a yield wakes itself: it is not a sleep");
+    assert_eq!(y.as_mut().poll(&mut cx), Poll::Ready(()));
+}

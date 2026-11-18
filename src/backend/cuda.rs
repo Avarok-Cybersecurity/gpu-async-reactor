@@ -17,7 +17,7 @@ use libloading::Library;
 use super::mapped::{Line, LineDriver, LineError};
 use crate::core::line::{CompletionLine, Slot};
 use crate::core::time::DurNs;
-use crate::core::wait::CompletionPort;
+use crate::core::wait::{CompletionPort, Pace};
 
 /// A `CUstream` handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,17 +300,21 @@ pub struct CudaPort<'a> {
     slot: Slot,
     seq: &'a mut u64,
     wait: Option<super::wordwait::WordWait>,
+    pace: Pace,
 }
 
 impl<'a> CudaPort<'a> {
     /// The port for `stream`, storing into `slot` of `line`; `seq` is that slot's last sequence
-    /// number (kept by the caller across waits). Without `wait` a park polls the word.
-    pub fn new(
+    /// number (kept by the caller across waits). A park sleeps in `wait` (the CPU's word wait);
+    /// without one, and between the status queries of a poll, the port does what `pace` says:
+    /// [`Pace::Spin`] for an inline host, [`Pace::Yield`] under an executor.
+    pub fn paced(
         line: &'a MappedLine,
         stream: CuStream,
         slot: Slot,
         seq: &'a mut u64,
         wait: Option<super::wordwait::WordWait>,
+        pace: Pace,
     ) -> Self {
         Self {
             line,
@@ -318,7 +322,37 @@ impl<'a> CudaPort<'a> {
             slot,
             seq,
             wait,
+            pace,
         }
+    }
+
+    /// [`CudaPort::paced`] with [`Pace::Spin`], the only pacing of 0.1.1. Under an executor a
+    /// spinning poll never yields and starves every other ready task: say which host this is.
+    #[deprecated(
+        since = "0.1.2",
+        note = "use `CudaPort::paced`: `Pace::Yield` under an executor, `Pace::Spin` inline"
+    )]
+    pub fn new(
+        line: &'a MappedLine,
+        stream: CuStream,
+        slot: Slot,
+        seq: &'a mut u64,
+        wait: Option<super::wordwait::WordWait>,
+    ) -> Self {
+        Self::paced(line, stream, slot, seq, wait, Pace::Spin)
+    }
+
+    /// Whether a park sleeps the core in hardware (`false`: it paces as declared, see
+    /// [`CudaPort::paced`]).
+    #[must_use]
+    pub fn parks_in_hardware(&self) -> bool {
+        self.wait.is_some()
+    }
+
+    /// The declared pacing.
+    #[must_use]
+    pub fn pace(&self) -> Pace {
+        self.pace
     }
 }
 
@@ -348,7 +382,7 @@ impl CompletionPort for CudaPort<'_> {
 
     async fn poll(&mut self) -> crate::Result<()> {
         while !self.query()? {
-            core::hint::spin_loop();
+            self.pace.step().await;
         }
         Ok(())
     }
@@ -361,9 +395,14 @@ impl CompletionPort for CudaPort<'_> {
     async fn park(&mut self, bound: DurNs) -> crate::Result<bool> {
         let (slot, seq) = (self.slot, *self.seq);
         let ready = |l: &CompletionLine| crate::core::line::reached(l, slot, seq);
-        Ok(match &self.wait {
-            Some(w) => w.park(self.line.line(), ready, Duration::from_nanos(bound.0)),
-            None => ready(self.line.line()),
-        })
+        match &self.wait {
+            Some(w) => Ok(w.park(self.line.line(), ready, Duration::from_nanos(bound.0))),
+            // No word wait: one paced step, never a return straight back into the park loop
+            // (a hot spin that never yields); the wait's backstop query still runs on time.
+            None => {
+                self.pace.step().await;
+                Ok(ready(self.line.line()))
+            }
+        }
     }
 }
